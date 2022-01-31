@@ -968,7 +968,6 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
                         toNettyResponse(response),
                         mapToHttpContent(nettyRequest, response, body, context)
                 );
-                nettyRequest.prepareHttp2ResponseIfNecessary(streamedResponse);
                 context.writeAndFlush(streamedResponse);
                 context.read();
             } else {
@@ -1184,9 +1183,6 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
             // close handled by HttpServerKeepAliveHandler
             final NettyHttpRequest<?> nettyHttpRequest = (NettyHttpRequest<?>) request;
 
-            if (isHttp2) {
-                addHttp2StreamHeader(request, nettyResponse);
-            }
             io.netty.handler.codec.http.HttpRequest nativeRequest = nettyHttpRequest.getNativeRequest();
 
             GenericFutureListener<Future<? super Void>> requestCompletor = future -> {
@@ -1262,13 +1258,6 @@ class RoutingInBoundHandler extends SimpleChannelInboundHandler<io.micronaut.htt
                     nettyResponse.status().code(),
                     request.getMethodName(),
                     request.getUri());
-        }
-    }
-
-    private void addHttp2StreamHeader(HttpRequest<?> request, io.netty.handler.codec.http.HttpResponse nettyResponse) {
-        final String streamId = request.getHeaders().get(AbstractNettyHttpRequest.STREAM_ID);
-        if (streamId != null) {
-            nettyResponse.headers().set(AbstractNettyHttpRequest.STREAM_ID, streamId);
         }
     }
 
