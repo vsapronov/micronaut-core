@@ -1,13 +1,32 @@
+/*
+ * Copyright 2017-2022 original authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package io.micronaut.http.server.netty;
 
 import io.micronaut.core.naming.Named;
+import io.micronaut.http.context.event.HttpRequestReceivedEvent;
 import io.micronaut.http.netty.channel.ChannelPipelineCustomizer;
 import io.micronaut.http.netty.stream.HttpStreamsServerHandler;
 import io.micronaut.http.server.netty.configuration.NettyHttpServerConfiguration;
 import io.micronaut.http.server.netty.decoders.HttpRequestDecoder;
 import io.micronaut.http.server.netty.encoders.HttpResponseEncoder;
 import io.micronaut.http.server.netty.handler.accesslog.HttpAccessLogHandler;
+import io.micronaut.http.server.netty.ssl.HttpRequestCertificateHandler;
 import io.micronaut.http.server.netty.websocket.NettyServerWebSocketUpgradeHandler;
+import io.micronaut.http.server.util.HttpHostResolver;
+import io.micronaut.http.ssl.ServerSslConfiguration;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
@@ -71,16 +90,28 @@ final class HttpPipelineBuilder {
     static final AttributeKey<StreamPipeline> STREAM_PIPELINE_ATTRIBUTE = AttributeKey.newInstance("stream-pipeline");
 
     private final NettyHttpServer server;
+    private final NettyEmbeddedServices embeddedServices;
+    private final ServerSslConfiguration sslConfiguration;
+    private final RoutingInBoundHandler routingInBoundHandler;
+    private final HttpHostResolver hostResolver;
+
     private final LoggingHandler loggingHandler;
     private final SslContext sslContext;
     private final HttpAccessLogHandler accessLogHandler;
     private final HttpRequestDecoder requestDecoder;
     private final HttpResponseEncoder responseEncoder;
 
-    HttpPipelineBuilder(NettyHttpServer server) {
+    private final HttpRequestCertificateHandler requestCertificateHandler = new HttpRequestCertificateHandler();
+
+    HttpPipelineBuilder(NettyHttpServer server, NettyEmbeddedServices embeddedServices, ServerSslConfiguration sslConfiguration, RoutingInBoundHandler routingInBoundHandler, HttpHostResolver hostResolver) {
         this.server = server;
+        this.embeddedServices = embeddedServices;
+        this.sslConfiguration = sslConfiguration;
+        this.routingInBoundHandler = routingInBoundHandler;
+        this.hostResolver = hostResolver;
+
         loggingHandler = server.getServerConfiguration().getLogLevel().isPresent() ? new LoggingHandler(NettyHttpServer.class, server.getServerConfiguration().getLogLevel().get()) : null;
-        sslContext = server.getNettyEmbeddedServices().getServerSslBuilder() != null ? server.getNettyEmbeddedServices().getServerSslBuilder().build().orElse(null) : null;
+        sslContext = embeddedServices.getServerSslBuilder() != null ? embeddedServices.getServerSslBuilder().build().orElse(null) : null;
 
         NettyHttpServerConfiguration.AccessLogger accessLogger = server.getServerConfiguration().getAccessLogger();
         if (accessLogger != null && accessLogger.isEnabled()) {
@@ -92,9 +123,9 @@ final class HttpPipelineBuilder {
         requestDecoder = new HttpRequestDecoder(server,
                 server.getEnvironment(),
                 server.getServerConfiguration(),
-                server.getHttpRequestReceivedEventPublisher());
+                embeddedServices.getEventPublisher(HttpRequestReceivedEvent.class));
         responseEncoder = new HttpResponseEncoder(
-                server.getNettyEmbeddedServices().getMediaTypeCodecRegistry(),
+                embeddedServices.getMediaTypeCodecRegistry(),
                 server.getServerConfiguration()
         );
     }
@@ -170,7 +201,7 @@ final class HttpPipelineBuilder {
 
             if (ssl) {
                 SslHandler sslHandler = sslContext.newHandler(channel.alloc());
-                sslHandler.setHandshakeTimeoutMillis(server.getSslConfiguration().getHandshakeTimeout().toMillis());
+                sslHandler.setHandshakeTimeoutMillis(sslConfiguration.getHandshakeTimeout().toMillis());
                 pipeline.addLast(ChannelPipelineCustomizer.HANDLER_SSL, sslHandler);
 
                 insertPcapLoggingHandler("ssl-decapsulated");
@@ -397,16 +428,16 @@ final class HttpPipelineBuilder {
             pipeline.addLast(ChannelPipelineCustomizer.HANDLER_HTTP_CHUNK, new ChunkedWriteHandler());
             pipeline.addLast(HttpRequestDecoder.ID, requestDecoder);
             if (server.getServerConfiguration().isDualProtocol() && server.getServerConfiguration().isHttpToHttpsRedirect() && !ssl) {
-                pipeline.addLast(ChannelPipelineCustomizer.HANDLER_HTTP_TO_HTTPS_REDIRECT, new HttpToHttpsRedirectHandler(server.getSslConfiguration(), server.getHostResolver()));
+                pipeline.addLast(ChannelPipelineCustomizer.HANDLER_HTTP_TO_HTTPS_REDIRECT, new HttpToHttpsRedirectHandler(sslConfiguration, hostResolver));
             }
             if (ssl) {
-                pipeline.addLast("request-certificate-handler", server.getRequestCertificateHandler());
+                pipeline.addLast("request-certificate-handler", requestCertificateHandler);
             }
             pipeline.addLast(HttpResponseEncoder.ID, responseEncoder);
             pipeline.addLast(NettyServerWebSocketUpgradeHandler.ID, new NettyServerWebSocketUpgradeHandler(
-                    server.getNettyEmbeddedServices(),
+                    embeddedServices,
                     server.getWebSocketSessionRepository()));
-            pipeline.addLast(ChannelPipelineCustomizer.HANDLER_MICRONAUT_INBOUND, server.getRoutingHandler());
+            pipeline.addLast(ChannelPipelineCustomizer.HANDLER_MICRONAUT_INBOUND, routingInBoundHandler);
         }
 
         /**
@@ -421,9 +452,7 @@ final class HttpPipelineBuilder {
             registerMicronautChannelHandlers();
             pipeline.addLast(ChannelPipelineCustomizer.HANDLER_FLOW_CONTROL, new FlowControlHandler());
             pipeline.addLast(ChannelPipelineCustomizer.HANDLER_HTTP_KEEP_ALIVE, new HttpServerKeepAliveHandler());
-            pipeline.addLast(ChannelPipelineCustomizer.HANDLER_HTTP_COMPRESSOR, new SmartHttpContentCompressor(
-                    server.getNettyEmbeddedServices().getHttpCompressionStrategy()
-            ));
+            pipeline.addLast(ChannelPipelineCustomizer.HANDLER_HTTP_COMPRESSOR, new SmartHttpContentCompressor(embeddedServices.getHttpCompressionStrategy()));
             pipeline.addLast(ChannelPipelineCustomizer.HANDLER_HTTP_DECOMPRESSOR, new HttpContentDecompressor());
 
             insertMicronautHandlers();
@@ -434,7 +463,7 @@ final class HttpPipelineBuilder {
          */
         private void registerMicronautChannelHandlers() {
             int i = 0;
-            for (ChannelOutboundHandler outboundHandlerAdapter : server.getNettyEmbeddedServices().getOutboundHandlers()) {
+            for (ChannelOutboundHandler outboundHandlerAdapter : embeddedServices.getOutboundHandlers()) {
                 String name;
                 if (outboundHandlerAdapter instanceof Named) {
                     name = ((Named) outboundHandlerAdapter).getName();
